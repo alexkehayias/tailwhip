@@ -54,6 +54,7 @@ const (
 	ssmSecretPath   = "/tailwhip/webhook_secret"
 	replayWindow    = 5 * time.Minute
 	upstreamTimeout = 10 * time.Second
+	maxBodySize     = 1 << 20 // reject webhook bodies > 1 MiB
 )
 
 func init() {
@@ -155,6 +156,12 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.AP
 		}
 		body = decoded
 	}
+	// Reject oversized bodies before HMAC work or forwarding to bound memory
+	// usage and avoid flooding the upstream.
+	if len(body) > maxBodySize {
+		log.Printf("WARN: body too large (%d bytes)", len(body))
+		return errorResp(413, "body too large"), nil
+	}
 
 	// Require X-Webhook-Timestamp for replay protection (±5min window).
 	ts := headerGet(req, "X-Webhook-Timestamp")
@@ -181,7 +188,7 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.AP
 	}
 	expected := computeHMAC(secret, []byte(ts+"."+string(body)))
 	if !hmac.Equal([]byte(sig), []byte(expected)) {
-		log.Printf("WARN: HMAC mismatch (got %q)", sig)
+		log.Println("WARN: HMAC mismatch")
 		return errorResp(401, "invalid signature"), nil
 	}
 
