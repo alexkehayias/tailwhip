@@ -61,7 +61,8 @@ resource "aws_lambda_function" "webhook" {
     }
   }
 
-  depends_on = [aws_iam_role_policy_attachment.logs]
+  reserved_concurrent_executions = 10
+  depends_on                    = [aws_iam_role_policy_attachment.logs]
 }
 
 # Public HTTPS endpoint. HMAC is the only auth — no AWS IAM gate on requests.
