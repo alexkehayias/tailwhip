@@ -77,3 +77,25 @@ func TestRawPath(t *testing.T) {
 		}
 	}
 }
+
+func TestParseUpstream(t *testing.T) {
+	const env = "TEST_UPSTREAM_URL"
+	t.Setenv(env, "")
+	if u, err := parseUpstream(env); err != nil || u != nil {
+		t.Fatalf("empty env: got (%v, %v), want (nil, nil)", u, err)
+	}
+
+	t.Setenv(env, "http://100.64.0.5:1234/github-webhook")
+	u, err := parseUpstream(env)
+	if err != nil {
+		t.Fatalf("valid env: unexpected error: %v", err)
+	}
+	if u == nil || u.String() != "http://100.64.0.5:1234/github-webhook" {
+		t.Fatalf("valid env: got %v, want parsed URL", u)
+	}
+
+	t.Setenv(env, "://bad url")
+	if u, err := parseUpstream(env); err == nil {
+		t.Fatalf("malformed env: got (%v, nil), want error", u)
+	}
+}

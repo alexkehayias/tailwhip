@@ -10,6 +10,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
+	"net/url"
 	"strings"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -17,20 +18,24 @@ import (
 
 // provider describes one webhook sender's verification scheme.
 type provider struct {
-	name       string
-	secretPath string
-	secret     string // populated at init
-	header     string
-	verify     func(p *provider, req *events.APIGatewayV2HTTPRequest, body []byte) error
+	name        string
+	secretPath  string
+	secret      string // populated at init; only when the provider is enabled
+	header      string
+	verify      func(p *provider, req *events.APIGatewayV2HTTPRequest, body []byte) error
+	upstreamEnv string   // env var holding this provider's upstream URL; "" = disabled
+	upstream    *url.URL // parsed at init from upstreamEnv; nil = disabled
 }
 
-// providers maps each reserved path to its verifier.
+// providers maps each reserved path to its verifier. A provider is enabled iff
+// its upstreamEnv variable is set; a disabled provider's path returns 404.
 var providers = map[string]*provider{
 	"/github": {
-		name:       "github",
-		secretPath: ssmGithubSecretPath,
-		header:     "X-Hub-Signature-256",
-		verify:     verifyGitHub,
+		name:        "github",
+		secretPath:  ssmGithubSecretPath,
+		header:      "X-Hub-Signature-256",
+		verify:      verifyGitHub,
+		upstreamEnv: "GITHUB_UPSTREAM_URL",
 	},
 }
 

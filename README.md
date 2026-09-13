@@ -63,10 +63,13 @@ The Lambda joins your tailnet as an ephemeral node so it auto-cleans when the ex
 cd lambda && ./build.sh
 # → produces lambda/bootstrap (28MB, ~10s build)
 
-# 2. Deploy — pass your upstream server's Tailscale address
+# 2. Deploy — pass your upstream server's Tailscale address, plus per-provider
+#    upstreams for any providers you want to enable (github_upstream_url)
 cd ..
 tofu init
-tofu apply -var target_url="http://<your-tailscale-ip>:1234/webhook"
+tofu apply \
+  -var target_url="http://<your-tailscale-ip>:1234/webhook" \
+  -var github_upstream_url="http://<your-tailscale-ip>:1234/github-webhook"
 
 # 3. Read the output
 tofu output function_url
@@ -74,7 +77,7 @@ tofu output function_url
 
 The upstream server **must be listening on a Tailnet-reachable address** — not `127.0.0.1`. Use your Tailscale IPv4 (`tailscale ip -4` to find it) or bind `0.0.0.0`. If the server binds to `127.0.0.1`, the Lambda can't reach it.
 
-The `target_url` should include the full path (e.g., `/api/webhook`). The Lambda forwards verbatim — method, path, headers, body — so any upstream route works.
+The `target_url` is the **default** upstream (used by the `/` path) and should include the full path (e.g., `/api/webhook`). Each enabled provider forwards to its own upstream (see [Providers](#providers)). The Lambda forwards verbatim — method, path, headers, body — so any upstream route works.
 
 ## Sending a webhook
 
@@ -101,20 +104,21 @@ Missing/stale timestamp or bad signature → `401` (Lambda rejects before dialin
 
 ## Providers
 
-The Lambda routes by URL path. The root `/` (and any non-reserved path) uses the generic HMAC scheme above. Reserved paths are verified with that sender's native signature and forwarded to the same `TARGET_URL`.
+The Lambda routes by URL path. The root `/` (and any non-reserved path) uses the generic HMAC scheme above and forwards to the default `TARGET_URL`. Reserved paths are verified with that sender's native signature and forwarded to that provider's **own** upstream URL. A provider is enabled by setting its upstream URL Terraform variable; if it's left empty, the provider is disabled and its path returns `404`.
 
-| Path | Verified with | Secret in SSM |
-|------|---------------|---------------|
-| `/` (default) | `X-Webhook-Signature` over `timestamp.body` | `/tailwhip/default_webhook_secret` |
-| `/github` | `X-Hub-Signature-256` (`sha256=` HMAC over the raw body) | `/tailwhip/github_webhook_secret` |
+| Path | Verified with | Secret in SSM | Upstream (Terraform var → env var) |
+|------|---------------|---------------|-------------------------------------|
+| `/` (default) | `X-Webhook-Signature` over `timestamp.body` | `/tailwhip/default_webhook_secret` | `target_url` → `TARGET_URL` |
+| `/github` | `X-Hub-Signature-256` (`sha256=` HMAC over the raw body) | `/tailwhip/github_webhook_secret` | `github_upstream_url` → `GITHUB_UPSTREAM_URL` |
 
 ### GitHub
 
 1. Create a GitHub App or OAuth App and set its **webhook URL** to `<function_url>/github` and a **webhook secret** of your choosing.
 2. Store that same secret as `/tailwhip/github_webhook_secret` in SSM (SecureString).
-3. GitHub signs the raw request body with HMAC-SHA256 and sends it as `X-Hub-Signature-256: sha256=...`. GitHub sends no timestamp, so replay safety relies on the secret staying secret.
+3. Set `github_upstream_url` in Terraform to the Tailnet URL of the service that should receive GitHub webhooks, then `tofu apply`.
+4. GitHub signs the raw request body with HMAC-SHA256 and sends it as `X-Hub-Signature-256: sha256=...`. GitHub sends no timestamp, so replay safety relies on the secret staying secret.
 
-All secrets are required at cold start — if `/tailwhip/github_webhook_secret` is missing, the Lambda won't start. (Existing deployments upgrading to a version with the `/github` path must create this parameter before redeploying.)
+The default secret and each **enabled** provider's secret are required at cold start — if a required one is missing, the Lambda won't start. A provider whose upstream URL isn't set is disabled: its secret isn't required, and its path returns `404`.
 
 ## Verification
 
@@ -142,7 +146,7 @@ Confirm the `tailwhip` node appears in https://login.tailscale.com/admin/machine
 | `lambda/providers_test.go` | Unit tests for the provider verifiers and path routing. |
 | `lambda/build.sh` | Cross-compile to `bootstrap` (linux/amd64, CGO disabled). |
 | `main.tf` | AWS + archive providers, region config. |
-| `variables.tf` | Input vars: `target_url`, `region`, `tailscale_hostname`. |
+| `variables.tf` | Input vars: `target_url`, `github_upstream_url`, `region`, `tailscale_hostname`. |
 | `lambda.tf` | Lambda function, IAM role (scoped SSM read), Function URL, log group. |
 | `outputs.tf` | `function_url`, `log_group_name`. |
 

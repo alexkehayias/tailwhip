@@ -1,6 +1,12 @@
 variable "target_url" {
-  description = "Full URL of the upstream webhook endpoint on the Tailnet (e.g., http://100.x.y.z:1234/webhook)."
+  description = "Full URL of the upstream webhook endpoint on the Tailnet (e.g., http://100.x.y.z:1234/webhook). Used for the default `/` path."
   type        = string
+}
+
+variable "github_upstream_url" {
+  description = "Full URL of the GitHub webhook's upstream endpoint on the Tailnet (e.g., http://100.x.y.z:1234/github-webhook). Leave empty to disable the /github provider."
+  type        = string
+  default     = ""
 }
 
 variable "region" {

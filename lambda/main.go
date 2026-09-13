@@ -17,12 +17,14 @@ import (
 	"crypto/hmac"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -69,14 +71,20 @@ func initialize() {
 		log.Fatalf("loading AWS config: %v", err)
 	}
 
-	// Fetch all secrets in one GetParameters call (single round-trip).
+	// Resolve provider upstreams first: the set of enabled providers determines
+	// which SSM secrets are required below. A provider whose upstream env var is
+	// unset is disabled and needs no secret.
+	enabled := resolveProviderUpstreams()
+
+	// Fetch required secrets in one GetParameters call (single round-trip): the
+	// auth key, the default webhook secret, and each enabled provider's secret.
 	ssmClient := ssm.NewFromConfig(cfg)
+	ssmNames := []string{ssmAuthKeyPath, ssmDefaultSecretPath}
+	for _, p := range enabled {
+		ssmNames = append(ssmNames, p.secretPath)
+	}
 	resp, err := ssmClient.GetParameters(ctx, &ssm.GetParametersInput{
-		Names: []string{
-			ssmAuthKeyPath,
-			ssmDefaultSecretPath,
-			ssmGithubSecretPath,
-		},
+		Names:          ssmNames,
 		WithDecryption: aws.Bool(true),
 	})
 	if err != nil {
@@ -93,15 +101,19 @@ func initialize() {
 		}
 		values[*p.Name] = *p.Value
 	}
-	// Fail fast: a missing secret means the endpoint can't verify its senders,
-	// so refuse to start rather than silently accepting/rejecting everything.
-	for _, path := range []string{ssmAuthKeyPath, ssmDefaultSecretPath, ssmGithubSecretPath} {
+	// Fail fast: a missing required secret means the endpoint can't verify its
+	// senders, so refuse to start rather than silently accepting/rejecting
+	// everything. Disabled providers aren't in ssmNames, so their secrets aren't
+	// required.
+	for _, path := range ssmNames {
 		if values[path] == "" {
 			log.Fatalf("missing SSM parameter %s", path)
 		}
 	}
 	secret = values[ssmDefaultSecretPath]
-	providers["/github"].secret = values[ssmGithubSecretPath]
+	for _, p := range enabled {
+		p.secret = values[p.secretPath]
+	}
 
 	// tsnet needs a writable config dir, but the Lambda runtime doesn't set
 	// $HOME. Point it at /tmp (Lambda's ephemeral scratch space); losing state
@@ -154,7 +166,53 @@ func initialize() {
 		sigHeader = "X-Webhook-Signature"
 	}
 
-	log.Printf("initialized: target=%s, hostname=%s", targetURL.String(), hostname)
+	names := make([]string, 0, len(enabled))
+	for _, p := range enabled {
+		names = append(names, p.name)
+	}
+	log.Printf("initialized: target=%s, hostname=%s, providers=%v", targetURL.String(), hostname, names)
+}
+
+// resolveProviderUpstreams parses each provider's upstream env var. A provider
+// with an unset/empty var is disabled (upstream stays nil). Returns the enabled
+// providers in deterministic (sorted path) order, which also drives which SSM
+// secrets are required.
+func resolveProviderUpstreams() []*provider {
+	paths := make([]string, 0, len(providers))
+	for path := range providers {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	var enabled []*provider
+	for _, path := range paths {
+		p := providers[path]
+		u, err := parseUpstream(p.upstreamEnv)
+		if err != nil {
+			log.Fatalf("%s: %v", p.name, err)
+		}
+		p.upstream = u
+		if u != nil {
+			enabled = append(enabled, p)
+		}
+	}
+	if len(enabled) == 0 {
+		log.Println("WARN: no webhook providers enabled (no upstream URLs configured)")
+	}
+	return enabled
+}
+
+// parseUpstream parses the URL in envVar. Returns nil if the var is unset or
+// empty (provider disabled); returns an error if present but malformed.
+func parseUpstream(envVar string) (*url.URL, error) {
+	s := os.Getenv(envVar)
+	if s == "" {
+		return nil, nil
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return nil, fmt.Errorf("parsing %s %q: %w", envVar, s, err)
+	}
+	return u, nil
 }
 
 // handler routes by path. Reserved provider paths (e.g. /github) use that
@@ -180,11 +238,15 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.AP
 	}
 
 	if p, ok := providers[rawPath(&req)]; ok {
+		if p.upstream == nil {
+			log.Printf("WARN: %s not enabled (no upstream configured)", p.name)
+			return errorResp(404, "not found"), nil
+		}
 		if err := p.verify(p, &req, body); err != nil {
 			log.Printf("WARN: %s verification failed: %v", p.name, err)
 			return errorResp(401, "invalid signature"), nil
 		}
-		return forward(ctx, req, body)
+		return forward(ctx, req, body, p.upstream)
 	}
 	return handleDefault(ctx, req, body)
 }
@@ -220,22 +282,22 @@ func handleDefault(ctx context.Context, req events.APIGatewayV2HTTPRequest, body
 		log.Println("WARN: HMAC mismatch")
 		return errorResp(401, "invalid signature"), nil
 	}
-	return forward(ctx, req, body)
+	return forward(ctx, req, body, targetURL)
 }
 
-// forward copies the request to the upstream over Tailscale and returns the
-// response verbatim.
-func forward(ctx context.Context, req events.APIGatewayV2HTTPRequest, body []byte) (events.APIGatewayV2HTTPResponse, error) {
+// forward copies the request to the given upstream destination over Tailscale
+// and returns the response verbatim.
+func forward(ctx context.Context, req events.APIGatewayV2HTTPRequest, body []byte, dest *url.URL) (events.APIGatewayV2HTTPResponse, error) {
 	method := req.RequestContext.HTTP.Method
 	if method == "" {
 		method = "POST"
 	}
-	forwardReq, err := http.NewRequestWithContext(ctx, method, targetURL.String(), bytes.NewReader(body))
+	forwardReq, err := http.NewRequestWithContext(ctx, method, dest.String(), bytes.NewReader(body))
 	if err != nil {
 		return errorResp(500, "internal error"), nil
 	}
 	// Copy headers through; skip hop-by-hop and Lambda-internal ones. The Host
-	// header is set by http.NewRequest from targetURL — don't copy the original.
+	// header is set by http.NewRequest from dest — don't copy the original.
 	for k, v := range req.Headers {
 		if strings.EqualFold(k, "host") ||
 			strings.EqualFold(k, "x-forwarded-for") ||

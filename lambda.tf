@@ -55,9 +55,10 @@ resource "aws_lambda_function" "webhook" {
 
   environment {
     variables = {
-      TARGET_URL         = var.target_url
-      TAILSCALE_HOSTNAME = var.tailscale_hostname
-      SIG_HEADER         = "X-Webhook-Signature"
+      TARGET_URL          = var.target_url
+      GITHUB_UPSTREAM_URL = var.github_upstream_url
+      TAILSCALE_HOSTNAME  = var.tailscale_hostname
+      SIG_HEADER          = "X-Webhook-Signature"
     }
   }
 
