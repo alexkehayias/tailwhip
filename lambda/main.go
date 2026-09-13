@@ -15,9 +15,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log"
@@ -50,14 +48,19 @@ var (
 )
 
 const (
-	ssmAuthKeyPath  = "/tailwhip/ts_authkey"
-	ssmSecretPath   = "/tailwhip/webhook_secret"
-	replayWindow    = 5 * time.Minute
-	upstreamTimeout = 10 * time.Second
-	maxBodySize     = 1 << 20 // reject webhook bodies > 1 MiB
+	ssmAuthKeyPath       = "/tailwhip/ts_authkey"
+	ssmDefaultSecretPath = "/tailwhip/default_webhook_secret"
+	ssmGithubSecretPath  = "/tailwhip/github_webhook_secret"
+	replayWindow         = 5 * time.Minute
+	upstreamTimeout      = 10 * time.Second
+	maxBodySize          = 1 << 20 // reject webhook bodies > 1 MiB
 )
 
-func init() {
+// initialize performs the one-time cold-start setup: fetch secrets from SSM,
+// start tsnet, and build the Tailscale-backed HTTP client. Called from main()
+// before the handler is registered, and not from init() so unit tests can load
+// the package without AWS/network access.
+func initialize() {
 	ctx := context.Background()
 
 	// AWS config — Lambda's IAM role provides credentials via env.
@@ -66,10 +69,14 @@ func init() {
 		log.Fatalf("loading AWS config: %v", err)
 	}
 
-	// Fetch both secrets in one GetParameters call (single round-trip).
+	// Fetch all secrets in one GetParameters call (single round-trip).
 	ssmClient := ssm.NewFromConfig(cfg)
 	resp, err := ssmClient.GetParameters(ctx, &ssm.GetParametersInput{
-		Names:          []string{ssmAuthKeyPath, ssmSecretPath},
+		Names: []string{
+			ssmAuthKeyPath,
+			ssmDefaultSecretPath,
+			ssmGithubSecretPath,
+		},
 		WithDecryption: aws.Bool(true),
 	})
 	if err != nil {
@@ -79,22 +86,29 @@ func init() {
 		log.Printf("WARN: SSM invalid parameters: %v", resp.InvalidParameters)
 	}
 
-	var authKey, webhookSecret string
+	values := map[string]string{}
 	for _, p := range resp.Parameters {
 		if p.Name == nil || p.Value == nil {
 			continue
 		}
-		switch *p.Name {
-		case ssmAuthKeyPath:
-			authKey = *p.Value
-		case ssmSecretPath:
-			webhookSecret = *p.Value
+		values[*p.Name] = *p.Value
+	}
+	// Fail fast: a missing secret means the endpoint can't verify its senders,
+	// so refuse to start rather than silently accepting/rejecting everything.
+	for _, path := range []string{ssmAuthKeyPath, ssmDefaultSecretPath, ssmGithubSecretPath} {
+		if values[path] == "" {
+			log.Fatalf("missing SSM parameter %s", path)
 		}
 	}
-	if authKey == "" || webhookSecret == "" {
-		log.Fatalf("missing SSM parameters (authkey set: %v, secret set: %v)", authKey != "", webhookSecret != "")
+	secret = values[ssmDefaultSecretPath]
+	providers["/github"].secret = values[ssmGithubSecretPath]
+
+	// tsnet needs a writable config dir, but the Lambda runtime doesn't set
+	// $HOME. Point it at /tmp (Lambda's ephemeral scratch space); losing state
+	// is fine since the node is ephemeral and re-joins on each cold start.
+	if os.Getenv("HOME") == "" {
+		os.Setenv("HOME", "/tmp")
 	}
-	secret = webhookSecret
 
 	// Start tsnet — joins the tailnet as an ephemeral node so it auto-cleans
 	// when the Lambda execution environment is recycled (no stale nodes).
@@ -103,7 +117,7 @@ func init() {
 		hostname = "tailwhip"
 	}
 	tsServer = &tsnet.Server{
-		AuthKey:   authKey,
+		AuthKey:   values[ssmAuthKeyPath],
 		Hostname:  hostname,
 		Ephemeral: true,
 	}
@@ -122,12 +136,14 @@ func init() {
 	}
 
 	// HTTP client with a Tailscale-backed dial — outbound requests flow over
-	// the tailnet to the upstream server's private address. The addr arg from
-	// http.Transport is ignored; we always dial targetURL.Host.
+	// the tailnet to the upstream server's private address. Dial the addr that
+	// net/http derived from the request URL (host:port, with the scheme's
+	// default port applied) so hosts without an explicit port work; tsnet.Dial
+	// requires an explicit port.
 	httpClient = &http.Client{
 		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return tsServer.Dial(ctx, "tcp", targetURL.Host)
+			DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+				return tsServer.Dial(ctx, "tcp", addr)
 			},
 		},
 		Timeout: upstreamTimeout,
@@ -141,10 +157,10 @@ func init() {
 	log.Printf("initialized: target=%s, hostname=%s", targetURL.String(), hostname)
 }
 
-// handler verifies the HMAC-SHA256 signature on every request. For valid
-// signatures, it forwards the request to the upstream server over Tailscale and
-// returns the response verbatim. Invalid signatures or stale/missing timestamps
-// get a 401 (no forwarding).
+// handler routes by path. Reserved provider paths (e.g. /github) use that
+// provider's native signature verification; everything else (including the
+// root "/") uses the default HMAC scheme. Valid requests are forwarded to the
+// upstream server over Tailscale and the response returned verbatim.
 func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.APIGatewayV2HTTPResponse, error) {
 	// API Gateway may base64-encode non-UTF8 request bodies — decode first so
 	// the HMAC is computed against exactly what the sender signed.
@@ -163,6 +179,19 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.AP
 		return errorResp(413, "body too large"), nil
 	}
 
+	if p, ok := providers[rawPath(&req)]; ok {
+		if err := p.verify(p, &req, body); err != nil {
+			log.Printf("WARN: %s verification failed: %v", p.name, err)
+			return errorResp(401, "invalid signature"), nil
+		}
+		return forward(ctx, req, body)
+	}
+	return handleDefault(ctx, req, body)
+}
+
+// handleDefault verifies the default HMAC scheme: X-Webhook-Signature over
+// timestamp.body, with X-Webhook-Timestamp (±5min) replay protection.
+func handleDefault(ctx context.Context, req events.APIGatewayV2HTTPRequest, body []byte) (events.APIGatewayV2HTTPResponse, error) {
 	// Require X-Webhook-Timestamp for replay protection (±5min window).
 	ts := headerGet(req, "X-Webhook-Timestamp")
 	if ts == "" {
@@ -191,8 +220,12 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.AP
 		log.Println("WARN: HMAC mismatch")
 		return errorResp(401, "invalid signature"), nil
 	}
+	return forward(ctx, req, body)
+}
 
-	// Forward to upstream over Tailscale.
+// forward copies the request to the upstream over Tailscale and returns the
+// response verbatim.
+func forward(ctx context.Context, req events.APIGatewayV2HTTPRequest, body []byte) (events.APIGatewayV2HTTPResponse, error) {
 	method := req.RequestContext.HTTP.Method
 	if method == "" {
 		method = "POST"
@@ -242,13 +275,23 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.AP
 	}, nil
 }
 
+// rawPath returns the request path, preferring RawPath (Lambda Function URLs
+// populate it) and defaulting to "/" when empty.
+func rawPath(req *events.APIGatewayV2HTTPRequest) string {
+	if p := req.RawPath; p != "" {
+		return p
+	}
+	if p := req.RequestContext.HTTP.Path; p != "" {
+		return p
+	}
+	return "/"
+}
+
 // computeHMAC returns "sha256=<hex>" — the format callers send in the signature
 // header. The full string (including "sha256=" prefix) is compared via hmac.Equal
 // so an attacker can't shorten-prefix-match a truncated hash.
 func computeHMAC(secret string, payload []byte) string {
-	h := hmac.New(sha256.New, []byte(secret))
-	h.Write(payload)
-	return "sha256=" + hex.EncodeToString(h.Sum(nil))
+	return "sha256=" + hmacSHA256Hex(secret, payload)
 }
 
 // headerGet returns a header value from an API Gateway V2 request. API Gateway
@@ -271,5 +314,6 @@ func errorResp(code int, msg string) events.APIGatewayV2HTTPResponse {
 }
 
 func main() {
+	initialize()
 	lambda.Start(handler)
 }

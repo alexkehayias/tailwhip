@@ -4,9 +4,8 @@ variable "target_url" {
 }
 
 variable "region" {
-  description = "AWS region for the Lambda."
+  description = "AWS region for the Lambda. Required — must be set explicitly."
   type        = string
-  default     = "us-east-1"
 }
 
 variable "tailscale_hostname" {

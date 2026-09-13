@@ -51,7 +51,7 @@ resource "aws_lambda_function" "webhook" {
   filename         = data.archive_file.zip.output_path
   source_code_hash = data.archive_file.zip.output_base64sha256
   memory_size      = 512 # tsnet + Go runtime need headroom; 128MB risks OOM on cold start
-  timeout          = 15   # less than the caller's 30s timeout
+  timeout          = 15  # less than the caller's 30s timeout
 
   environment {
     variables = {
@@ -62,13 +62,36 @@ resource "aws_lambda_function" "webhook" {
   }
 
   reserved_concurrent_executions = 10
-  depends_on                    = [aws_iam_role_policy_attachment.logs]
+  depends_on                     = [aws_iam_role_policy_attachment.logs]
 }
 
 # Public HTTPS endpoint. HMAC is the only auth — no AWS IAM gate on requests.
 resource "aws_lambda_function_url" "webhook" {
   function_name      = aws_lambda_function.webhook.function_name
   authorization_type = "NONE"
+}
+
+# Function URLs with authorization_type = "NONE" need an explicit resource-based
+# policy granting public invocation. AWS REQUIRES the FunctionUrlAuthType
+# condition on a Principal "*" + InvokeFunctionUrl grant — omitting it makes
+# AddPermission fail with InvalidParameterValueException. The console also wants
+# lambda:InvokeFunction granted to "*" for public access; both statements are
+# provided. depends_on orders them after the Function URL is created.
+resource "aws_lambda_permission" "url" {
+  action                 = "lambda:InvokeFunctionUrl"
+  function_name          = aws_lambda_function.webhook.function_name
+  principal              = "*"
+  function_url_auth_type = "NONE"
+
+  depends_on = [aws_lambda_function_url.webhook]
+}
+
+resource "aws_lambda_permission" "url_invoke" {
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.webhook.function_name
+  principal     = "*"
+
+  depends_on = [aws_lambda_function_url.webhook]
 }
 
 # Log group with 14-day retention (default never-expire costs money).

@@ -2,13 +2,14 @@
 
 An AWS Lambda that acts as a public webhook ingress for an upstream server running on a Tailscale tailnet.
 
-The Lambda verifies an HMAC-SHA256 signature on every request (shared secret from SSM). For valid signatures, it joins the tailnet via [`tsnet`](https://pkg.go.dev/tailscale.com/tsnet) and forwards the request to the upstream server's Tailscale address. Without a valid signature, anyone who found the URL could proxy arbitrary traffic into your private network — so signature verification is mandatory, not optional.
+The Lambda verifies a signature on every request — provider paths (e.g. `/github`) use that sender's native signature scheme, the root path uses a generic HMAC (shared secret from SSM). For valid signatures, it joins the tailnet via [`tsnet`](https://pkg.go.dev/tailscale.com/tsnet) and forwards the request to the upstream server's Tailscale address. Without a valid signature, anyone who found the URL could proxy arbitrary traffic into your private network — so signature verification is mandatory, not optional.
 
 ```
-[webhook sender] --HTTPS--> [Lambda Function URL]
+[webhook sender] --HTTPS--> [Lambda Function URL] /<path>
                                 |
-                             verify HMAC-SHA256
-                              (shared secret from SSM)
+                             verify signature
+                          (provider-native or default HMAC,
+                             secret from SSM)
                                 |  valid
                              tsnet.Dial(ctx, "tcp", <upstream-tailscale-ip>:1234)
                                 |
@@ -34,7 +35,7 @@ The Lambda joins your tailnet as an ephemeral node so it auto-cleans when the ex
    openssl rand -hex 32
    ```
    This is what your webhook sender (GitHub, Stripe, custom script) will use to sign request bodies. Keep it secret.
-3. **Store both in SSM** as SecureString parameters — don't put secrets in Terraform state:
+3. **Store the secrets in SSM** as SecureString parameters — don't put secrets in Terraform state. The Lambda refuses to start if any are missing:
    ```bash
    aws ssm put-parameter \
      --name /tailwhip/ts_authkey \
@@ -42,8 +43,15 @@ The Lambda joins your tailnet as an ephemeral node so it auto-cleans when the ex
      --type SecureString
 
    aws ssm put-parameter \
-     --name /tailwhip/webhook_secret \
+     --name /tailwhip/default_webhook_secret \
      --value "<openssl rand -hex 32 output>" \
+     --type SecureString
+
+   # Required for the /github path. Use the "webhook secret" from your GitHub
+   # App or OAuth App's webhook settings.
+   aws ssm put-parameter \
+     --name /tailwhip/github_webhook_secret \
+     --value "<github webhook secret>" \
      --type SecureString
    ```
 4. **Tailscale ACLs**: for a personal tailnet with default `* -> *` ACLs, no changes. If your tailnet has restrictive ACLs, allow the Lambda's node (or a `tag:lambda` if you tag it) to reach the upstream server's Tailscale IP address.
@@ -74,7 +82,7 @@ Sign `timestamp + "." + body` with HMAC-SHA256 using the secret from SSM, and se
 
 ```bash
 SECRET=$(aws ssm get-parameter \
-  --name /tailwhip/webhook_secret \
+  --name /tailwhip/default_webhook_secret \
   --with-decryption --query Parameter.Value --output text)
 
 BODY='{"event":"test","data":"hello"}'
@@ -90,6 +98,23 @@ curl -X POST "$(tofu output -raw function_url)" \
 ```
 
 Missing/stale timestamp or bad signature → `401` (Lambda rejects before dialing Tailscale). Upstream server down → `502`. Successful forward returns the upstream response verbatim.
+
+## Providers
+
+The Lambda routes by URL path. The root `/` (and any non-reserved path) uses the generic HMAC scheme above. Reserved paths are verified with that sender's native signature and forwarded to the same `TARGET_URL`.
+
+| Path | Verified with | Secret in SSM |
+|------|---------------|---------------|
+| `/` (default) | `X-Webhook-Signature` over `timestamp.body` | `/tailwhip/default_webhook_secret` |
+| `/github` | `X-Hub-Signature-256` (`sha256=` HMAC over the raw body) | `/tailwhip/github_webhook_secret` |
+
+### GitHub
+
+1. Create a GitHub App or OAuth App and set its **webhook URL** to `<function_url>/github` and a **webhook secret** of your choosing.
+2. Store that same secret as `/tailwhip/github_webhook_secret` in SSM (SecureString).
+3. GitHub signs the raw request body with HMAC-SHA256 and sends it as `X-Hub-Signature-256: sha256=...`. GitHub sends no timestamp, so replay safety relies on the secret staying secret.
+
+All secrets are required at cold start — if `/tailwhip/github_webhook_secret` is missing, the Lambda won't start. (Existing deployments upgrading to a version with the `/github` path must create this parameter before redeploying.)
 
 ## Verification
 
@@ -112,11 +137,13 @@ Confirm the `tailwhip` node appears in https://login.tailscale.com/admin/machine
 
 | File | Purpose |
 |------|---------|
-| `lambda/main.go` | Go handler: SSM fetch, tsnet start, HMAC verify, reverse proxy forward. |
+| `lambda/main.go` | Go handler: SSM fetch, tsnet start, path routing + default HMAC verify, reverse proxy forward. |
+| `lambda/providers.go` | Provider registry + native signature verifiers (e.g. GitHub). |
+| `lambda/providers_test.go` | Unit tests for the provider verifiers and path routing. |
 | `lambda/build.sh` | Cross-compile to `bootstrap` (linux/amd64, CGO disabled). |
 | `main.tf` | AWS + archive providers, region config. |
 | `variables.tf` | Input vars: `target_url`, `region`, `tailscale_hostname`. |
 | `lambda.tf` | Lambda function, IAM role (scoped SSM read), Function URL, log group. |
 | `outputs.tf` | `function_url`, `log_group_name`. |
 
-Secrets (`ts_authkey`, `webhook_secret`) live in SSM Parameter Store, **not** in this directory. The IAM role grants `ssm:GetParameters` on `/tailwhip/*` — the Go code fetches them at cold start.
+Secrets (`ts_authkey`, `default_webhook_secret`, `github_webhook_secret`, ...) live in SSM Parameter Store, **not** in this directory. The IAM role grants `ssm:GetParameters` on `/tailwhip/*` — the Go code fetches them at cold start.

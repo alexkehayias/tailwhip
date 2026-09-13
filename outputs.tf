@@ -1,5 +1,5 @@
 output "function_url" {
-  description = "Public HTTPS URL for the webhook endpoint. POST here with an X-Webhook-Signature header."
+  description = "Public HTTPS URL for the webhook endpoint. The root path expects an X-Webhook-Signature header; reserved paths (e.g. /github) use that provider's native signature."
   value       = aws_lambda_function_url.webhook.function_url
 }
 
