@@ -102,6 +102,8 @@ curl -X POST "$(tofu output -raw function_url)" \
 
 Missing/stale timestamp or bad signature → `401` (Lambda rejects before dialing Tailscale). Upstream server down → `502`. Successful forward returns the upstream response verbatim.
 
+For a ready-made version of the above, run `./bin/live_test.sh` (needs AWS credentials for the deployment account, plus `tofu`, `openssl`, and `curl`).
+
 ## Providers
 
 The Lambda routes by URL path. The root `/` (and any non-reserved path) uses the generic HMAC scheme above and forwards to the default `TARGET_URL`. Reserved paths are verified with that sender's native signature and forwarded to that provider's **own** upstream URL. A provider is enabled by setting its upstream URL Terraform variable; if it's left empty, the provider is disabled and its path returns `404`.
