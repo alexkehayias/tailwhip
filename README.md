@@ -68,12 +68,17 @@ cd lambda && ./build.sh
 cd ..
 tofu init
 tofu apply \
+  -var region="<your-aws-region>" \
   -var target_url="http://<your-tailscale-ip>:1234/webhook" \
   -var github_upstream_url="http://<your-tailscale-ip>:1234/github-webhook"
 
 # 3. Read the output
 tofu output function_url
 ```
+
+For a one-shot version of steps 1–2, run `./bin/deploy.sh` with the same `-var`
+flags — it runs the Go checks, rebuilds the binary, then `tofu apply`. Run
+`tofu init` once beforehand.
 
 The upstream server **must be listening on a Tailnet-reachable address** — not `127.0.0.1`. Use your Tailscale IPv4 (`tailscale ip -4` to find it) or bind `0.0.0.0`. If the server binds to `127.0.0.1`, the Lambda can't reach it.
 
