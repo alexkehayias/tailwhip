@@ -147,6 +147,15 @@ tofu apply \
   -var stripe_upstream_url="http://<tailscale-ip>:1234/stripe-webhook"
 ```
 
+The build requires **Go ≥ 1.27.3**, enforced by the `go` directive in
+`lambda/go.mod`. This floor is a security requirement, not just a dependency
+one: Go 1.27.3 / 1.26.10 added the `crypto/x509` denylist for the compromised
+eMudhra intermediate CAs (CVE-2026-111943). Go does no CRL/OCSP revocation, so
+only a toolchain at or above that version rejects those certificates — don't
+lower the directive. `build.sh` uses whatever `go` is on `PATH`; with the
+default `GOTOOLCHAIN=auto` an older local Go auto-downloads 1.27.3, and under
+`GOTOOLCHAIN=local` the build fails.
+
 Before `tofu apply` with the provider enabled, create its SSM parameter or the
 Lambda won't start:
 

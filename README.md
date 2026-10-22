@@ -20,7 +20,7 @@ The Lambda verifies a signature on every request — provider paths (e.g. `/gith
 
 - **AWS account** with credentials configured locally (`aws sso login` or `~/.aws/credentials`). The Lambda needs an IAM role (Terraform creates it) but you need creds to run `tofu apply`.
 - **OpenTofu** ≥ 1.6 ([install](https://opentofu.org/docs/intro/install/)) — `brew install opentofu` on macOS.
-- **Go** ≥ 1.26 — for building the Lambda binary (`tailscale.com/tsnet` requires a recent Go).
+- **Go** ≥ 1.27.3 — for building the Lambda binary. The floor is a security requirement: Go 1.27.3 / 1.26.10 added the `crypto/x509` denylist for the compromised eMudhra intermediate CAs (CVE-2026-111943). Go does no CRL/OCSP revocation, so a binary built with an older toolchain still trusts them. `lambda/go.mod` requires ≥ 1.27.3, so an older local Go auto-downloads the pinned toolchain (or fails under `GOTOOLCHAIN=local`).
 - **Tailscale admin access** — to generate an auth key for the Lambda.
 
 ## Tailscale setup (one-time)
@@ -61,7 +61,7 @@ The Lambda joins your tailnet as an ephemeral node so it auto-cleans when the ex
 ```bash
 # 1. Build the Go binary (cross-compile for Amazon Linux 2023, x86_64)
 cd lambda && ./build.sh
-# → produces lambda/bootstrap (28MB, ~10s build)
+# → produces lambda/bootstrap (~30MB, ~10s build)
 
 # 2. Deploy — pass your upstream server's Tailscale address, plus per-provider
 #    upstreams for any providers you want to enable (github_upstream_url)
