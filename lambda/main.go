@@ -50,12 +50,13 @@ var (
 )
 
 const (
-	ssmAuthKeyPath       = "/tailwhip/ts_authkey"
-	ssmDefaultSecretPath = "/tailwhip/default_webhook_secret"
-	ssmGithubSecretPath  = "/tailwhip/github_webhook_secret"
-	replayWindow         = 5 * time.Minute
-	upstreamTimeout      = 10 * time.Second
-	maxBodySize          = 1 << 20 // reject webhook bodies > 1 MiB
+	ssmAuthKeyPath         = "/tailwhip/ts_authkey"
+	ssmDefaultSecretPath   = "/tailwhip/default_webhook_secret"
+	ssmGithubSecretPath    = "/tailwhip/github_webhook_secret"
+	ssmTailscaleSecretPath = "/tailwhip/tailscale_webhook_secret"
+	replayWindow           = 5 * time.Minute
+	upstreamTimeout        = 10 * time.Second
+	maxBodySize            = 1 << 20 // reject webhook bodies > 1 MiB
 )
 
 // initialize performs the one-time cold-start setup: fetch secrets from SSM,

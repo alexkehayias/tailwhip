@@ -53,6 +53,13 @@ The Lambda joins your tailnet as an ephemeral node so it auto-cleans when the ex
      --name /tailwhip/github_webhook_secret \
      --value "<github webhook secret>" \
      --type SecureString
+
+   # Required for the /tailscale path. Use the secret shown when you create
+   # the webhook in the Tailscale admin console (tskey-webhook-...).
+   aws ssm put-parameter \
+     --name /tailwhip/tailscale_webhook_secret \
+     --value "<tailscale webhook secret>" \
+     --type SecureString
    ```
 4. **Tailscale ACLs**: for a personal tailnet with default `* -> *` ACLs, no changes. If your tailnet has restrictive ACLs, allow the Lambda's node (or a `tag:lambda` if you tag it) to reach the upstream server's Tailscale IP address.
 
@@ -64,13 +71,15 @@ cd lambda && ./build.sh
 # → produces lambda/bootstrap (~30MB, ~10s build)
 
 # 2. Deploy — pass your upstream server's Tailscale address, plus per-provider
-#    upstreams for any providers you want to enable (github_upstream_url)
+#    upstreams for any providers you want to enable (github_upstream_url,
+#    tailscale_upstream_url)
 cd ..
 tofu init
 tofu apply \
   -var region="<your-aws-region>" \
   -var target_url="http://<your-tailscale-ip>:1234/webhook" \
-  -var github_upstream_url="http://<your-tailscale-ip>:1234/github-webhook"
+  -var github_upstream_url="http://<your-tailscale-ip>:1234/github-webhook" \
+  -var tailscale_upstream_url="http://<your-tailscale-ip>:1234/tailscale-webhook"
 
 # 3. Read the output
 tofu output function_url
@@ -117,6 +126,7 @@ The Lambda routes by URL path. The root `/` (and any non-reserved path) uses the
 |------|---------------|---------------|-------------------------------------|
 | `/` (default) | `X-Webhook-Signature` over `timestamp.body` | `/tailwhip/default_webhook_secret` | `target_url` → `TARGET_URL` |
 | `/github` | `X-Hub-Signature-256` (`sha256=` HMAC over the raw body) | `/tailwhip/github_webhook_secret` | `github_upstream_url` → `GITHUB_UPSTREAM_URL` |
+| `/tailscale` | `Tailscale-Webhook-Signature` (`v1=` HMAC over `timestamp.body`) | `/tailwhip/tailscale_webhook_secret` | `tailscale_upstream_url` → `TAILSCALE_UPSTREAM_URL` |
 
 ### GitHub
 
@@ -124,6 +134,13 @@ The Lambda routes by URL path. The root `/` (and any non-reserved path) uses the
 2. Store that same secret as `/tailwhip/github_webhook_secret` in SSM (SecureString).
 3. Set `github_upstream_url` in Terraform to the Tailnet URL of the service that should receive GitHub webhooks, then `tofu apply`.
 4. GitHub signs the raw request body with HMAC-SHA256 and sends it as `X-Hub-Signature-256: sha256=...`. GitHub sends no timestamp, so replay safety relies on the secret staying secret.
+
+### Tailscale
+
+1. In the Tailscale admin console, open **Settings → Webhooks** and add a webhook with the endpoint URL `<function_url>/tailscale`. Subscribe it to the **Node created** (`nodeCreated`) event — or any other events you want forwarded. Tailscale shows a secret of the form `tskey-webhook-...`; save it.
+2. Store that secret as `/tailwhip/tailscale_webhook_secret` in SSM (SecureString).
+3. Set `tailscale_upstream_url` in Terraform to the Tailnet URL of the service that should receive Tailscale webhooks, then `tofu apply`.
+4. Tailscale sends `Tailscale-Webhook-Signature: t=<unix>,v1=<hex>`, where the hex is HMAC-SHA256 over `<unix>.<raw body>`. The Lambda rejects timestamps more than ±5 minutes from now and accepts any matching `v1=` signature (Tailscale may include several during secret rotation). The body is a JSON array of events, forwarded verbatim — so the upstream receives the full batch, including `nodeCreated` events.
 
 The default secret and each **enabled** provider's secret are required at cold start — if a required one is missing, the Lambda won't start. A provider whose upstream URL isn't set is disabled: its secret isn't required, and its path returns `404`.
 
@@ -153,8 +170,8 @@ Confirm the `tailwhip` node appears in https://login.tailscale.com/admin/machine
 | `lambda/providers_test.go` | Unit tests for the provider verifiers and path routing. |
 | `lambda/build.sh` | Cross-compile to `bootstrap` (linux/amd64, CGO disabled). |
 | `main.tf` | AWS + archive providers, region config. |
-| `variables.tf` | Input vars: `target_url`, `github_upstream_url`, `region`, `tailscale_hostname`. |
+| `variables.tf` | Input vars: `target_url`, `github_upstream_url`, `tailscale_upstream_url`, `region`, `tailscale_hostname`. |
 | `lambda.tf` | Lambda function, IAM role (scoped SSM read), Function URL, log group. |
 | `outputs.tf` | `function_url`, `log_group_name`. |
 
-Secrets (`ts_authkey`, `default_webhook_secret`, `github_webhook_secret`, ...) live in SSM Parameter Store, **not** in this directory. The IAM role grants `ssm:GetParameters` on `/tailwhip/*` — the Go code fetches them at cold start.
+Secrets (`ts_authkey`, `default_webhook_secret`, `github_webhook_secret`, `tailscale_webhook_secret`, ...) live in SSM Parameter Store, **not** in this directory. The IAM role grants `ssm:GetParameters` on `/tailwhip/*` — the Go code fetches them at cold start.
