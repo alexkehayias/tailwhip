@@ -9,6 +9,12 @@ variable "github_upstream_url" {
   default     = ""
 }
 
+variable "tailscale_upstream_url" {
+  description = "Full URL of the Tailscale webhook's upstream endpoint on the Tailnet (e.g., http://100.x.y.z:1234/tailscale-webhook). Leave empty to disable the /tailscale provider."
+  type        = string
+  default     = ""
+}
+
 variable "region" {
   description = "AWS region for the Lambda. Required — must be set explicitly."
   type        = string
