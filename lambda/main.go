@@ -338,16 +338,46 @@ func forward(ctx context.Context, req events.APIGatewayV2HTTPRequest, body []byt
 	}, nil
 }
 
-// rawPath returns the request path, preferring RawPath (Lambda Function URLs
-// populate it) and defaulting to "/" when empty.
+// rawPath returns the request path used for routing, preferring RawPath (Lambda
+// Function URLs populate it) and defaulting to "/" when empty. The result is
+// normalized so trailing or repeated slashes still match reserved paths.
 func rawPath(req *events.APIGatewayV2HTTPRequest) string {
 	if p := req.RawPath; p != "" {
-		return p
+		return normalizePath(p)
 	}
 	if p := req.RequestContext.HTTP.Path; p != "" {
-		return p
+		return normalizePath(p)
 	}
 	return "/"
+}
+
+// normalizePath collapses repeated slashes and drops a trailing slash, so that
+// "/tailscale", "/tailscale/", and "//tailscale" all route identically. It does
+// not resolve "." or ".." segments and preserves case, so reserved paths remain
+// case-sensitive.
+func normalizePath(p string) string {
+	if p == "" {
+		return "/"
+	}
+	var b strings.Builder
+	b.Grow(len(p))
+	prevSlash := false
+	for i := 0; i < len(p); i++ {
+		if c := p[i]; c == '/' {
+			if prevSlash {
+				continue
+			}
+			prevSlash = true
+		} else {
+			prevSlash = false
+		}
+		b.WriteByte(p[i])
+	}
+	out := b.String()
+	if len(out) > 1 {
+		out = strings.TrimSuffix(out, "/")
+	}
+	return out
 }
 
 // computeHMAC returns "sha256=<hex>" — the format callers send in the signature

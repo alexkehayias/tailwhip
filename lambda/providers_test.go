@@ -157,6 +157,11 @@ func TestRawPath(t *testing.T) {
 		{"raw path preferred", &events.APIGatewayV2HTTPRequest{RawPath: "/github", RequestContext: httpCtx("/github")}, "/github"},
 		{"http path fallback", &events.APIGatewayV2HTTPRequest{RequestContext: httpCtx("/foo")}, "/foo"},
 		{"empty defaults to root", &events.APIGatewayV2HTTPRequest{}, "/"},
+		{"trailing slash trimmed", &events.APIGatewayV2HTTPRequest{RawPath: "/github/"}, "/github"},
+		{"repeated slashes collapsed", &events.APIGatewayV2HTTPRequest{RawPath: "//github//"}, "/github"},
+		{"root stays root", &events.APIGatewayV2HTTPRequest{RawPath: "/"}, "/"},
+		{"fallback trailing slash trimmed", &events.APIGatewayV2HTTPRequest{RequestContext: httpCtx("/foo/")}, "/foo"},
+		{"case preserved", &events.APIGatewayV2HTTPRequest{RawPath: "/GitHub/"}, "/GitHub"},
 	}
 	for _, c := range cases {
 		if got := rawPath(c.req); got != c.want {

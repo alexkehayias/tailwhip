@@ -122,6 +122,8 @@ For a ready-made version of the above, run `./bin/live_test.sh` (needs AWS crede
 
 The Lambda routes by URL path. The root `/` (and any non-reserved path) uses the generic HMAC scheme above and forwards to the default `TARGET_URL`. Reserved paths are verified with that sender's native signature and forwarded to that provider's **own** upstream URL. A provider is enabled by setting its upstream URL Terraform variable; if it's left empty, the provider is disabled and its path returns `404`.
 
+Path matching is case-sensitive, but repeated and trailing slashes are normalized — `/github`, `/github/`, and `//github` all route to the `/github` provider. Provider URLs are built from the `function_url` output, which already ends in `/`, so append the path directly (`$(tofu output -raw function_url)github`).
+
 | Path | Verified with | Secret in SSM | Upstream (Terraform var → env var) |
 |------|---------------|---------------|-------------------------------------|
 | `/` (default) | `X-Webhook-Signature` over `timestamp.body` | `/tailwhip/default_webhook_secret` | `target_url` → `TARGET_URL` |
@@ -130,14 +132,14 @@ The Lambda routes by URL path. The root `/` (and any non-reserved path) uses the
 
 ### GitHub
 
-1. Create a GitHub App or OAuth App and set its **webhook URL** to `<function_url>/github` and a **webhook secret** of your choosing.
+1. Create a GitHub App or OAuth App and set its **webhook URL** to `$(tofu output -raw function_url)github` and a **webhook secret** of your choosing.
 2. Store that same secret as `/tailwhip/github_webhook_secret` in SSM (SecureString).
 3. Set `github_upstream_url` in Terraform to the Tailnet URL of the service that should receive GitHub webhooks, then `tofu apply`.
 4. GitHub signs the raw request body with HMAC-SHA256 and sends it as `X-Hub-Signature-256: sha256=...`. GitHub sends no timestamp, so replay safety relies on the secret staying secret.
 
 ### Tailscale
 
-1. In the Tailscale admin console, open **Settings → Webhooks** and add a webhook with the endpoint URL `<function_url>/tailscale`. Subscribe it to the **Node created** (`nodeCreated`) event — or any other events you want forwarded. Tailscale shows a secret of the form `tskey-webhook-...`; save it.
+1. In the Tailscale admin console, open **Settings → Webhooks** and add a webhook with the endpoint URL `$(tofu output -raw function_url)tailscale`. Subscribe it to the **Node created** (`nodeCreated`) event — or any other events you want forwarded. Tailscale shows a secret of the form `tskey-webhook-...`; save it.
 2. Store that secret as `/tailwhip/tailscale_webhook_secret` in SSM (SecureString).
 3. Set `tailscale_upstream_url` in Terraform to the Tailnet URL of the service that should receive Tailscale webhooks, then `tofu apply`.
 4. Tailscale sends `Tailscale-Webhook-Signature: t=<unix>,v1=<hex>`, where the hex is HMAC-SHA256 over `<unix>.<raw body>`. The Lambda rejects timestamps more than ±5 minutes from now and accepts any matching `v1=` signature (Tailscale may include several during secret rotation). The body is a JSON array of events, forwarded verbatim — so the upstream receives the full batch, including `nodeCreated` events.
@@ -168,6 +170,7 @@ Confirm the `tailwhip` node appears in https://login.tailscale.com/admin/machine
 | `lambda/main.go` | Go handler: SSM fetch, tsnet start, path routing + default HMAC verify, reverse proxy forward. |
 | `lambda/providers.go` | Provider registry + native signature verifiers (e.g. GitHub). |
 | `lambda/providers_test.go` | Unit tests for the provider verifiers and path routing. |
+| `lambda/handler_tailscale_test.go` | End-to-end handler test for the `/tailscale` path (routing → verify → forward). |
 | `lambda/build.sh` | Cross-compile to `bootstrap` (linux/amd64, CGO disabled). |
 | `main.tf` | AWS + archive providers, region config. |
 | `variables.tf` | Input vars: `target_url`, `github_upstream_url`, `tailscale_upstream_url`, `region`, `tailscale_hostname`. |

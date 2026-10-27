@@ -173,8 +173,10 @@ aws ssm put-parameter \
 
 - **Don't break the default path.** Any path not in `providers` falls through to
   `handleDefault`. Keep reserved paths specific and documented.
-- **Paths are exact and case-sensitive** (`rawPath` returns the raw path;
-  `/Stripe` ≠ `/stripe`).
+- **Paths are case-sensitive but slash-normalized.** `rawPath` runs the path
+  through `normalizePath`, which collapses repeated slashes and drops a trailing
+  slash, so `/tailscale`, `/tailscale/`, and `//tailscale` all match. Case is
+  preserved: `/Stripe` ≠ `/stripe`.
 - **Never add the signature verification as a no-op "stub".** Verification is
   the project's core security guarantee — the README stresses it is mandatory.
 - **A provider without an upstream is disabled, not forwarded.** If
