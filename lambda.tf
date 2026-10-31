@@ -50,7 +50,7 @@ resource "aws_lambda_function" "webhook" {
   handler          = "bootstrap"
   filename         = data.archive_file.zip.output_path
   source_code_hash = data.archive_file.zip.output_base64sha256
-  memory_size      = 512 # tsnet + Go runtime need headroom; 128MB risks OOM on cold start
+  memory_size      = 256 # tsnet + Go runtime need headroom; 128MB risks OOM on cold start
   timeout          = 15  # less than the caller's 30s timeout
 
   environment {
