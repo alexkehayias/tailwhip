@@ -40,6 +40,13 @@ var providers = map[string]*provider{
 		verify:      verifyGitHub,
 		upstreamEnv: "GITHUB_UPSTREAM_URL",
 	},
+	"/lm-proxy": {
+		name:        "lm-proxy",
+		secretPath:  ssmLmProxySecretPath,
+		header:      "X-Webhook-Signature",
+		verify:      verifyLmProxy,
+		upstreamEnv: "LM_PROXY_UPSTREAM_URL",
+	},
 	"/tailscale": {
 		name:        "tailscale",
 		secretPath:  ssmTailscaleSecretPath,
@@ -47,6 +54,47 @@ var providers = map[string]*provider{
 		verify:      verifyTailscale,
 		upstreamEnv: "TAILSCALE_UPSTREAM_URL",
 	},
+}
+
+// timestampHeader carries the Unix timestamp a generic-scheme sender signed.
+const timestampHeader = "X-Webhook-Timestamp"
+
+// verifyHmacTimestamp checks the generic HMAC scheme: X-Webhook-Signature
+// ("sha256=<hex>" HMAC-SHA256 over "<timestamp>.<raw body>") with an
+// X-Webhook-Timestamp inside the replay window. The default "/" path and the
+// lm-proxy provider share this scheme; each has its own secret and signature
+// header.
+func verifyHmacTimestamp(secret, sigHeader string, req *events.APIGatewayV2HTTPRequest, body []byte) error {
+	ts := headerGet(*req, timestampHeader)
+	if ts == "" {
+		return errors.New("missing timestamp")
+	}
+	tsInt, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil {
+		return errors.New("invalid timestamp")
+	}
+	skew := time.Since(time.Unix(tsInt, 0))
+	if skew > replayWindow || skew < -replayWindow {
+		return errors.New("stale request")
+	}
+
+	sig := headerGet(*req, sigHeader)
+	if sig == "" {
+		return errors.New("missing signature")
+	}
+	// hmac.Equal is constant-time; compare the full "sha256=<hex>" string so a
+	// truncated hash can't prefix-match.
+	expected := computeHMAC(secret, []byte(ts+"."+string(body)))
+	if !hmac.Equal([]byte(sig), []byte(expected)) {
+		return errors.New("invalid signature")
+	}
+	return nil
+}
+
+// verifyLmProxy checks lm-proxy's metrics posts, which use the generic
+// timestamp + HMAC scheme.
+func verifyLmProxy(p *provider, req *events.APIGatewayV2HTTPRequest, body []byte) error {
+	return verifyHmacTimestamp(p.secret, p.header, req, body)
 }
 
 // verifyGitHub checks the X-Hub-Signature-256 header: "sha256=<hex>" HMAC over

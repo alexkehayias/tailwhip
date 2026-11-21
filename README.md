@@ -2,7 +2,7 @@
 
 An AWS Lambda that acts as a public webhook ingress for an upstream server running on a Tailscale tailnet.
 
-The Lambda verifies a signature on every request — provider paths (e.g. `/github`) use that sender's native signature scheme, the root path uses a generic HMAC (shared secret from SSM). For valid signatures, it joins the tailnet via [`tsnet`](https://pkg.go.dev/tailscale.com/tsnet) and forwards the request to the upstream server's Tailscale address. Without a valid signature, anyone who found the URL could proxy arbitrary traffic into your private network — so signature verification is mandatory, not optional.
+The Lambda verifies a signature on every request — provider paths (e.g. `/github`) use that sender's native signature scheme, the root path and `/lm-proxy` use a generic HMAC (shared secrets from SSM). For valid signatures, it joins the tailnet via [`tsnet`](https://pkg.go.dev/tailscale.com/tsnet) and forwards the request to the upstream server's Tailscale address. Without a valid signature, anyone who found the URL could proxy arbitrary traffic into your private network — so signature verification is mandatory, not optional.
 
 ```
 [webhook sender] --HTTPS--> [Lambda Function URL] /<path>
@@ -60,6 +60,13 @@ The Lambda joins your tailnet as an ephemeral node so it auto-cleans when the ex
      --name /tailwhip/tailscale_webhook_secret \
      --value "<tailscale webhook secret>" \
      --type SecureString
+
+   # Required for the /lm-proxy path. Use the shared secret you configure as
+   # METRICS_SECRET in lm-proxy.
+   aws ssm put-parameter \
+     --name /tailwhip/lm_proxy_webhook_secret \
+     --value "<openssl rand -hex 32 output>" \
+     --type SecureString
    ```
 4. **Tailscale ACLs**: for a personal tailnet with default `* -> *` ACLs, no changes. If your tailnet has restrictive ACLs, allow the Lambda's node (or a `tag:lambda` if you tag it) to reach the upstream server's Tailscale IP address.
 
@@ -72,14 +79,15 @@ cd lambda && ./build.sh
 
 # 2. Deploy — pass your upstream server's Tailscale address, plus per-provider
 #    upstreams for any providers you want to enable (github_upstream_url,
-#    tailscale_upstream_url)
+#    tailscale_upstream_url, lm_proxy_upstream_url)
 cd ..
 tofu init
 tofu apply \
   -var region="<your-aws-region>" \
   -var target_url="http://<your-tailscale-ip>:1234/webhook" \
   -var github_upstream_url="http://<your-tailscale-ip>:1234/github-webhook" \
-  -var tailscale_upstream_url="http://<your-tailscale-ip>:1234/tailscale-webhook"
+  -var tailscale_upstream_url="http://<your-tailscale-ip>:1234/tailscale-webhook" \
+  -var lm_proxy_upstream_url="http://<your-tailscale-ip>:1234/api/webhook/lm-proxy"
 
 # 3. Read the output
 tofu output function_url
@@ -128,6 +136,7 @@ Path matching is case-sensitive, but repeated and trailing slashes are normalize
 |------|---------------|---------------|-------------------------------------|
 | `/` (default) | `X-Webhook-Signature` over `timestamp.body` | `/tailwhip/default_webhook_secret` | `target_url` → `TARGET_URL` |
 | `/github` | `X-Hub-Signature-256` (`sha256=` HMAC over the raw body) | `/tailwhip/github_webhook_secret` | `github_upstream_url` → `GITHUB_UPSTREAM_URL` |
+| `/lm-proxy` | `X-Webhook-Signature` (`sha256=` HMAC over `timestamp.body`) | `/tailwhip/lm_proxy_webhook_secret` | `lm_proxy_upstream_url` → `LM_PROXY_UPSTREAM_URL` |
 | `/tailscale` | `Tailscale-Webhook-Signature` (`v1=` HMAC over `timestamp.body`) | `/tailwhip/tailscale_webhook_secret` | `tailscale_upstream_url` → `TAILSCALE_UPSTREAM_URL` |
 
 ### GitHub
@@ -143,6 +152,16 @@ Path matching is case-sensitive, but repeated and trailing slashes are normalize
 2. Store that secret as `/tailwhip/tailscale_webhook_secret` in SSM (SecureString).
 3. Set `tailscale_upstream_url` in Terraform to the Tailnet URL of the service that should receive Tailscale webhooks, then `tofu apply`.
 4. Tailscale sends `Tailscale-Webhook-Signature: t=<unix>,v1=<hex>`, where the hex is HMAC-SHA256 over `<unix>.<raw body>`. The Lambda rejects timestamps more than ±5 minutes from now and accepts any matching `v1=` signature (Tailscale may include several during secret rotation). The body is a JSON array of events, forwarded verbatim — so the upstream receives the full batch, including `nodeCreated` events.
+
+### lm-proxy
+
+[lm-proxy](https://github.com/alexkehayias/lm-proxy) posts token usage after each proxied LLM request. It uses the same generic HMAC scheme as the default path, but with its own secret and upstream so it doesn't share a route with other senders.
+
+1. Generate a shared secret (`openssl rand -hex 32`) and store it as `/tailwhip/lm_proxy_webhook_secret` in SSM (SecureString).
+2. Set `lm_proxy_upstream_url` in Terraform to the hq endpoint (e.g. `http://<tailnet-ip>:2222/api/webhook/lm-proxy`), then `tofu apply`.
+3. Configure lm-proxy with `--metrics-url "$(tofu output -raw function_url)lm-proxy"` and `--metrics-secret "<the same secret>"` (or the `METRICS_URL` / `METRICS_SECRET` env vars in Docker).
+
+lm-proxy sends `X-Webhook-Timestamp: <unix>` and `X-Webhook-Signature: sha256=<hex HMAC-SHA256 over "<unix>.<raw body>">`. The Lambda rejects timestamps more than ±5 minutes from now, so the sender's clock must be NTP-synced.
 
 The default secret and each **enabled** provider's secret are required at cold start — if a required one is missing, the Lambda won't start. A provider whose upstream URL isn't set is disabled: its secret isn't required, and its path returns `404`.
 
@@ -170,10 +189,11 @@ Confirm the `tailwhip` node appears in https://login.tailscale.com/admin/machine
 | `lambda/main.go` | Go handler: SSM fetch, tsnet start, path routing + default HMAC verify, reverse proxy forward. |
 | `lambda/providers.go` | Provider registry + native signature verifiers (e.g. GitHub). |
 | `lambda/providers_test.go` | Unit tests for the provider verifiers and path routing. |
+| `lambda/handler_lmproxy_test.go` | End-to-end handler test for the `/lm-proxy` path (routing → verify → forward). |
 | `lambda/handler_tailscale_test.go` | End-to-end handler test for the `/tailscale` path (routing → verify → forward). |
 | `lambda/build.sh` | Cross-compile to `bootstrap` (linux/amd64, CGO disabled). |
 | `main.tf` | AWS + archive providers, region config. |
-| `variables.tf` | Input vars: `target_url`, `github_upstream_url`, `tailscale_upstream_url`, `region`, `tailscale_hostname`. |
+| `variables.tf` | Input vars: `target_url`, `github_upstream_url`, `tailscale_upstream_url`, `lm_proxy_upstream_url`, `region`, `tailscale_hostname`. |
 | `lambda.tf` | Lambda function, IAM role (scoped SSM read), Function URL, log group. |
 | `outputs.tf` | `function_url`, `log_group_name`. |
 

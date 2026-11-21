@@ -124,6 +124,79 @@ func TestVerifyTailscale(t *testing.T) {
 	}
 }
 
+// hmacTimestampSig builds the generic-scheme signature header value:
+// "sha256=" + HMAC-SHA256 over "<unix>.<body>", computed independently of the
+// package's helpers.
+func hmacTimestampSig(secret string, ts time.Time, body []byte) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(strconv.FormatInt(ts.Unix(), 10)))
+	mac.Write([]byte("."))
+	mac.Write(body)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+}
+
+func TestVerifyLmProxy(t *testing.T) {
+	const secret = "test-secret"
+	p := &provider{name: "lm-proxy", header: "X-Webhook-Signature", secret: secret}
+	body := []byte(`{"input":10,"output":42,"cache_read":5,"cache_write":0}`)
+	now := time.Now()
+
+	valid := func() *events.APIGatewayV2HTTPRequest {
+		return &events.APIGatewayV2HTTPRequest{
+			Headers: map[string]string{
+				"x-webhook-timestamp": strconv.FormatInt(now.Unix(), 10),
+				"x-webhook-signature": hmacTimestampSig(secret, now, body),
+			},
+		}
+	}
+
+	if err := verifyLmProxy(p, valid(), body); err != nil {
+		t.Fatalf("valid signature rejected: %v", err)
+	}
+
+	if err := verifyLmProxy(p, valid(), []byte(`{"input":11}`)); err == nil {
+		t.Fatal("tampered body accepted")
+	}
+
+	req := valid()
+	req.Headers["x-webhook-signature"] = hmacTimestampSig("wrong-secret", now, body)
+	if err := verifyLmProxy(p, req, body); err == nil {
+		t.Fatal("wrong secret accepted")
+	}
+
+	req = valid()
+	delete(req.Headers, "x-webhook-timestamp")
+	if err := verifyLmProxy(p, req, body); err == nil {
+		t.Fatal("missing timestamp accepted")
+	}
+
+	req = valid()
+	req.Headers["x-webhook-timestamp"] = "not-a-number"
+	if err := verifyLmProxy(p, req, body); err == nil {
+		t.Fatal("invalid timestamp accepted")
+	}
+
+	req = valid()
+	stale := now.Add(-10 * time.Minute)
+	req.Headers["x-webhook-timestamp"] = strconv.FormatInt(stale.Unix(), 10)
+	req.Headers["x-webhook-signature"] = hmacTimestampSig(secret, stale, body)
+	if err := verifyLmProxy(p, req, body); err == nil {
+		t.Fatal("stale timestamp accepted")
+	}
+
+	req = valid()
+	delete(req.Headers, "x-webhook-signature")
+	if err := verifyLmProxy(p, req, body); err == nil {
+		t.Fatal("missing signature accepted")
+	}
+
+	req = valid()
+	req.Headers["x-webhook-signature"] = hmacTimestampSig(secret, now, []byte(`{}`))
+	if err := verifyLmProxy(p, req, body); err == nil {
+		t.Fatal("signature for a different body accepted")
+	}
+}
+
 func TestParseTailscaleSignatureMalformed(t *testing.T) {
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
 	cases := []struct {
