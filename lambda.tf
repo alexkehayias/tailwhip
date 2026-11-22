@@ -58,6 +58,7 @@ resource "aws_lambda_function" "webhook" {
       TARGET_URL             = var.target_url
       GITHUB_UPSTREAM_URL    = var.github_upstream_url
       TAILSCALE_UPSTREAM_URL = var.tailscale_upstream_url
+      LM_PROXY_UPSTREAM_URL  = var.lm_proxy_upstream_url
       TAILSCALE_HOSTNAME     = var.tailscale_hostname
       SIG_HEADER             = "X-Webhook-Signature"
     }

@@ -15,6 +15,12 @@ variable "tailscale_upstream_url" {
   default     = ""
 }
 
+variable "lm_proxy_upstream_url" {
+  description = "Full URL of lm-proxy's metrics webhook upstream endpoint on the Tailnet (e.g., http://100.x.y.z:1234/api/webhook/lm-proxy). Leave empty to disable the /lm-proxy provider."
+  type        = string
+  default     = ""
+}
+
 variable "region" {
   description = "AWS region for the Lambda. Required — must be set explicitly."
   type        = string

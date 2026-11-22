@@ -14,7 +14,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -25,7 +24,6 @@ import (
 	"net/url"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -54,6 +52,7 @@ const (
 	ssmDefaultSecretPath   = "/tailwhip/default_webhook_secret"
 	ssmGithubSecretPath    = "/tailwhip/github_webhook_secret"
 	ssmTailscaleSecretPath = "/tailwhip/tailscale_webhook_secret"
+	ssmLmProxySecretPath   = "/tailwhip/lm_proxy_webhook_secret"
 	replayWindow           = 5 * time.Minute
 	upstreamTimeout        = 10 * time.Second
 	maxBodySize            = 1 << 20 // reject webhook bodies > 1 MiB
@@ -252,36 +251,13 @@ func handler(ctx context.Context, req events.APIGatewayV2HTTPRequest) (events.AP
 	return handleDefault(ctx, req, body)
 }
 
-// handleDefault verifies the default HMAC scheme: X-Webhook-Signature over
-// timestamp.body, with X-Webhook-Timestamp (±5min) replay protection.
+// handleDefault verifies the default HMAC scheme (X-Webhook-Signature over
+// timestamp.body with X-Webhook-Timestamp replay protection) and forwards to
+// TARGET_URL.
 func handleDefault(ctx context.Context, req events.APIGatewayV2HTTPRequest, body []byte) (events.APIGatewayV2HTTPResponse, error) {
-	// Require X-Webhook-Timestamp for replay protection (±5min window).
-	ts := headerGet(req, "X-Webhook-Timestamp")
-	if ts == "" {
-		log.Println("WARN: missing X-Webhook-Timestamp header")
-		return errorResp(401, "missing timestamp"), nil
-	}
-	tsInt, err := strconv.ParseInt(ts, 10, 64)
-	if err != nil {
-		log.Printf("WARN: invalid timestamp %q: %v", ts, err)
-		return errorResp(401, "invalid timestamp"), nil
-	}
-	skew := time.Since(time.Unix(tsInt, 0))
-	if skew > replayWindow || skew < -replayWindow {
-		log.Printf("WARN: timestamp skew too large (%v)", skew)
-		return errorResp(401, "stale request"), nil
-	}
-
-	// Verify HMAC-SHA256 signature over timestamp.body. hmac.Equal is constant-time.
-	sig := headerGet(req, sigHeader)
-	if sig == "" {
-		log.Println("WARN: missing signature header")
-		return errorResp(401, "missing signature"), nil
-	}
-	expected := computeHMAC(secret, []byte(ts+"."+string(body)))
-	if !hmac.Equal([]byte(sig), []byte(expected)) {
-		log.Println("WARN: HMAC mismatch")
-		return errorResp(401, "invalid signature"), nil
+	if err := verifyHmacTimestamp(secret, sigHeader, &req, body); err != nil {
+		log.Printf("WARN: default verification failed: %v", err)
+		return errorResp(401, err.Error()), nil
 	}
 	return forward(ctx, req, body, targetURL)
 }
@@ -381,8 +357,8 @@ func normalizePath(p string) string {
 }
 
 // computeHMAC returns "sha256=<hex>" — the format callers send in the signature
-// header. The full string (including "sha256=" prefix) is compared via hmac.Equal
-// so an attacker can't shorten-prefix-match a truncated hash.
+// header. The full string (including "sha256=" prefix) is compared in constant
+// time so an attacker can't shorten-prefix-match a truncated hash.
 func computeHMAC(secret string, payload []byte) string {
 	return "sha256=" + hmacSHA256Hex(secret, payload)
 }
